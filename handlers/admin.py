@@ -2,6 +2,8 @@
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 from db import (
     async_session_maker, AdminRepository, StatisticsRepository,
@@ -10,6 +12,12 @@ from db import (
 from config import Config
 from utils import logger
 
+
+
+class AdStates(StatesGroup):
+    waiting_for_content = State()
+    waiting_for_buttons = State()
+    waiting_for_confirm = State()
 
 router = Router()
 
@@ -455,6 +463,139 @@ async def admin_ads_list(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin:ad:new")
+async def start_add_ad(callback: CallbackQuery, state: FSMContext):
+    """Start ad creation process."""
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("❌ Ruxsat yo'q!")
+        return
+
+    await callback.message.answer(
+        "📝 <b>Yangi reklama yaratish</b>\n\n"
+        "Reklama postini yuboring (Matn, Rasm, Video yoki Forward).\n"
+        "Bekor qilish uchun /cancel deb yozing."
+    )
+    await state.set_state(AdStates.waiting_for_content)
+    await callback.answer()
+
+
+@router.message(AdStates.waiting_for_content)
+async def process_ad_content(message: Message, state: FSMContext):
+    """Process ad content."""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Bekor qilindi.")
+        return
+
+    # Determine ad type and content
+    ad_type = AdType.TEXT
+    file_id = None
+    text = message.text or message.caption or ""
+
+    if message.photo:
+        ad_type = AdType.PHOTO
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        ad_type = AdType.VIDEO
+        file_id = message.video.file_id
+    elif message.animation:
+        ad_type = AdType.ANIMATION
+        file_id = message.animation.file_id
+
+    await state.update_data(
+        ad_type=ad_type,
+        file_id=file_id,
+        text=text
+    )
+
+    await message.answer(
+        "🔘 <b>Tugmalarni qo'shish</b>\n\n"
+        "Tugmalarni quyidagi formatda yuboring:\n"
+        "<code>Matn - URL</code>\n\n"
+        "Misol:\n"
+        "Kanalga o'tish - https://t.me/kanal\n"
+        "Sayt - https://example.com\n\n"
+        "Agar tugma kerak bo'lmasa, 'skip' deb yozing."
+    )
+    await state.set_state(AdStates.waiting_for_buttons)
+
+
+@router.message(AdStates.waiting_for_buttons)
+async def process_ad_buttons(message: Message, state: FSMContext):
+    """Process ad buttons."""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Bekor qilindi.")
+        return
+
+    buttons = []
+    if message.text.lower() != 'skip':
+        for line in message.text.split('\n'):
+            if ' - ' in line:
+                text, url = line.split(' - ', 1)
+                buttons.append({"text": text.strip(), "url": url.strip()})
+    
+    await state.update_data(buttons=buttons)
+    data = await state.get_data()
+
+    # Show preview
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    for btn in buttons:
+        builder.button(text=btn['text'], url=btn['url'])
+    builder.adjust(1)
+    
+    # Add confirm buttons
+    confirm_kb = InlineKeyboardBuilder()
+    confirm_kb.button(text="✅ Tasdiqlash", callback_data="ad:confirm")
+    confirm_kb.button(text="❌ Bekor qilish", callback_data="ad:cancel")
+    confirm_kb.adjust(2)
+
+    await message.answer("<b>Kutib turing, ko'rib chiqish (preview) tayyorlanmoqda...</b>")
+
+    try:
+        if data['ad_type'] == AdType.PHOTO:
+            await message.answer_photo(photo=data['file_id'], caption=data['text'], reply_markup=builder.as_markup())
+        elif data['ad_type'] == AdType.VIDEO:
+            await message.answer_video(video=data['file_id'], caption=data['text'], reply_markup=builder.as_markup())
+        else:
+            await message.answer(text=data['text'], reply_markup=builder.as_markup())
+        
+        await message.answer("Yuqoridagi reklama ko'rinishini tasdiqlaysizmi?", reply_markup=confirm_kb.as_markup())
+        await state.set_state(AdStates.waiting_for_confirm)
+
+    except Exception as e:
+        await message.answer(f"❌ Xatolik yuz berdi: {e}")
+        await state.clear()
+
+
+@router.callback_query(AdStates.waiting_for_confirm)
+async def confirm_ad(callback: CallbackQuery, state: FSMContext):
+    """Confirm and save ad."""
+    if callback.data == "ad:cancel":
+        await state.clear()
+        await callback.message.delete()
+        await callback.answer("❌ Bekor qilindi.")
+        return
+
+    data = await state.get_data()
+    
+    async with async_session_maker() as session:
+        ad_repo = AdRepository(session)
+        await ad_repo.create_ad(
+            ad_type=data['ad_type'],
+            text=data['text'],
+            file_id=data['file_id'],
+            buttons=data['buttons'],
+            is_active=True
+        )
+    
+    await state.clear()
+    await callback.message.delete()
+    await callback.message.answer("✅ <b>Reklama muvaffaqiyatli saqlandi!</b>")
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin:admins")
 async def admin_admins_menu(callback: CallbackQuery):
     """Show admins management menu."""
@@ -565,7 +706,9 @@ async def cmd_broadcast(message: Message):
         return
     
     # Get message text
-    text = message.text.replace("/broadcast", "").strip()
+    # Get message text explanation
+    content = message.text or message.caption or ""
+    text = content.replace("/broadcast", "").strip()
     
     # Validation: Must have text OR be a reply
     if not text and not message.reply_to_message:
